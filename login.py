@@ -14,7 +14,7 @@ render_auth_page()  ->  dispatcher on st.session_state.auth_view
     "register"      ->  create account
     "captcha"       ->  captcha challenge (login path)
     "forgot"        ->  request password-reset code
-    "forgot_otp"    ->  verify password-reset code
+    "forgot_captcha" ->  captcha challenge (password-reset path)
     "reset_password"->  set new password
 
 Session-state owned here
@@ -22,10 +22,11 @@ Session-state owned here
     user                  logged-in user dict or None
     auth_view             which screen is active
     pending_login_user    user dict waiting for login captcha
-    pending_reset_user    user dict waiting for reset OTP
+    pending_reset_user    user dict waiting for reset captcha
     login_captcha_question  text shown in the captcha challenge
     login_captcha_answer    expected answer for the captcha challenge
-    last_otp_banner       send_otp() result dict (dev mode code + flags)
+    reset_captcha_question  text shown in the reset captcha challenge
+    reset_captcha_answer    expected answer for the reset captcha challenge
     otp_reg_success       True after successful registration
     otp_reset_success     True after successful password reset
 
@@ -37,7 +38,6 @@ import random
 
 import config
 import database
-import otp_service
 import security
 
 
@@ -74,6 +74,8 @@ def _logo_header(subtitle: str):
 def _captcha_reset():
     st.session_state.pop("login_captcha_question", None)
     st.session_state.pop("login_captcha_answer", None)
+    st.session_state.pop("reset_captcha_question", None)
+    st.session_state.pop("reset_captcha_answer", None)
 
 
 def _captcha_generate():
@@ -92,6 +94,20 @@ def _captcha_generate():
     st.session_state.login_captcha_answer = str(answer)
 
 
+def _reset_captcha_generate():
+    left = random.randint(2, 9)
+    right = random.randint(1, 9)
+    op = random.choice(["+", "-"])
+    if op == "+":
+        answer = left + right
+    else:
+        left, right = max(left, right), min(left, right)
+        answer = left - right
+
+    st.session_state.reset_captcha_question = f"What is {left} {op} {right}?"
+    st.session_state.reset_captcha_answer = str(answer)
+
+
 def _captcha_banner():
     st.info("Solve the captcha below to complete sign-in. This replaces the email OTP step for login.")
 
@@ -103,6 +119,11 @@ def _ensure_login_captcha():
 
 def _verify_login_captcha(submitted_value: str) -> bool:
     expected = str(st.session_state.get("login_captcha_answer", "")).strip()
+    return submitted_value.strip() == expected
+
+
+def _verify_reset_captcha(submitted_value: str) -> bool:
+    expected = str(st.session_state.get("reset_captcha_answer", "")).strip()
     return submitted_value.strip() == expected
 
 
@@ -295,7 +316,7 @@ def _render_captcha():
 
 
 # ---------------------------------------------------------------------------
-# Forgot password  (request OTP)
+# Forgot password  (request captcha challenge)
 # ---------------------------------------------------------------------------
 
 def _render_forgot():
@@ -312,11 +333,10 @@ def _render_forgot():
             if submitted:
                 found = database.get_user_by_email(email.strip()) if email else None
                 if found:
-                    result = otp_service.send_otp(found, purpose="reset")
                     st.session_state.pending_reset_user = found
-                    st.session_state.last_otp_banner    = result
-                    database.log_action(found["id"], "reset_otp_sent")
-                    _set_view("forgot_otp")
+                    _reset_captcha_generate()
+                    database.log_action(found["id"], "reset_captcha_requested")
+                    _set_view("forgot_captcha")
                 else:
                     # Generic message — avoids disclosing which emails exist.
                     st.info("If that email is registered a reset code has been sent.")
@@ -325,8 +345,65 @@ def _render_forgot():
 
 
 # ---------------------------------------------------------------------------
-# Reset password  (set new password after OTP verified)
+# Reset password  (set new password after captcha verified)
 # ---------------------------------------------------------------------------
+
+
+def _render_forgot_captcha():
+    mid = _centered()
+    with mid:
+        _logo_header("Reset your password")
+
+        user = st.session_state.get("pending_reset_user")
+        if not user:
+            st.warning("Session expired.  Please start the reset process again.")
+            _nav_button("← Back to Login", key="nav_reset_captcha_expired", view="login")
+            return
+
+        if not st.session_state.get("reset_captcha_question"):
+            _reset_captcha_generate()
+
+        st.info("Solve the captcha to continue resetting your password.")
+
+        with st.form("forgot_captcha_form", clear_on_submit=False):
+            st.markdown(
+                f"<p style='margin:0 0 10px;color:#475569;font-size:0.95rem;'>"
+                f"{st.session_state.get('reset_captcha_question', 'Solve the captcha')}</p>",
+                unsafe_allow_html=True,
+            )
+            answer = st.text_input(
+                "Captcha answer",
+                placeholder="Enter the answer",
+                label_visibility="collapsed",
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                verify_clicked = st.form_submit_button(
+                    "✅ Verify Captcha",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with c2:
+                refresh_clicked = st.form_submit_button(
+                    "🔄 New Challenge",
+                    use_container_width=True,
+                )
+
+        if refresh_clicked:
+            _reset_captcha_generate()
+            st.rerun()
+
+        if verify_clicked:
+            if not answer.strip():
+                st.error("Please enter the captcha answer.")
+            elif _verify_reset_captcha(answer):
+                database.log_action(user["id"], "reset_captcha_verified")
+                st.session_state.reset_captcha_question = None
+                st.session_state.reset_captcha_answer = None
+                _set_view("reset_password")
+            else:
+                st.error("Incorrect captcha answer. Please try again.")
+                _reset_captcha_generate()
 
 def _render_reset_password():
     mid = _centered()
@@ -406,8 +483,8 @@ def render_auth_page():
         _render_captcha()
     elif view == "forgot":
         _render_forgot()
-    elif view == "forgot_otp":
-        _render_otp(purpose="reset")
+    elif view == "forgot_captcha":
+        _render_forgot_captcha()
     elif view == "reset_password":
         _render_reset_password()
     else:
