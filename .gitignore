@@ -10,10 +10,10 @@ database/shadowsec.db
 models/fallback_rf_model.pkl
 models/fallback_rf_model.pkl.label_encoder.pkl
 models/fallback_rf_model.pkl.scaler.pkl
+models/feature_list.pkl
 models/lstm_model.h5
 models/scaler.pkl
 models/label_encoder.pkl
-models/feature_list.pkl
 
 reports/*
 !reports/.gitkeep
