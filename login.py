@@ -1,0 +1,430 @@
+"""
+login.py
+----------
+Authentication UI module — complete OTP flow.
+
+Every interactive screen uses st.form so Streamlit captures widget values
+correctly at submit time.  Navigation links are plain st.button calls placed
+OUTSIDE the form context to avoid the "button disappears on next rerun" bug.
+
+Screens
+-------
+render_auth_page()  ->  dispatcher on st.session_state.auth_view
+    "login"         ->  username + password
+    "register"      ->  create account
+    "otp"           ->  6-digit code (login path)
+    "forgot"        ->  request password-reset code
+    "forgot_otp"    ->  verify password-reset code
+    "reset_password"->  set new password
+
+Session-state owned here
+------------------------
+    user                  logged-in user dict or None
+    auth_view             which screen is active
+    pending_otp_user      user dict waiting for login OTP
+    pending_reset_user    user dict waiting for reset OTP
+    last_otp_banner       send_otp() result dict (dev mode code + flags)
+    otp_reg_success       True after successful registration
+    otp_reset_success     True after successful password reset
+
+   # FUTURE SCOPE: plug in OAuth / SSO (Google Workspace, Okta, Azure AD).
+"""
+
+import streamlit as st
+
+import config
+import database
+import otp_service
+import security
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _set_view(view: str):
+    st.session_state.auth_view = view
+    st.rerun()
+
+
+def _centered():
+    _, mid, _ = st.columns([1, 1.4, 1])
+    return mid
+
+
+def _logo_header(subtitle: str):
+    st.markdown(
+        f"""
+        <div style="text-align:center;margin-bottom:18px;">
+          <div style="font-size:2rem;font-weight:800;
+               background:linear-gradient(95deg,#0369A1,#0EA5E9 45%,#22D3EE);
+               -webkit-background-clip:text;background-clip:text;color:transparent;">
+            🛡️ {config.APP_NAME}
+          </div>
+          <div style="color:#64748B;font-size:0.95rem;">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _otp_dev_banner(send_result: dict):
+    """Orange banner that surfaces the OTP code when SMTP is not configured."""
+    if not send_result.get("dev_mode"):
+        st.success("📧 Verification code sent to your email address.")
+        return
+    code = send_result.get("otp", "")
+    label = (
+        "⚠️ SMTP failed — showing code here"
+        if send_result.get("error")
+        else "🔧 Dev mode — no SMTP configured"
+    )
+    st.markdown(
+        f"""
+        <div style="background:#FFF7ED;border:2px solid #F97316;border-radius:10px;
+                    padding:16px 20px;margin-bottom:14px;text-align:center;">
+          <div style="color:#9A3412;font-size:0.8rem;font-weight:600;margin-bottom:6px;">
+            {label}
+          </div>
+          <div style="color:#1E293B;font-size:0.85rem;margin-bottom:10px;">
+            Your one-time verification code:
+          </div>
+          <div style="font-size:2.6rem;font-weight:900;letter-spacing:0.4em;
+                      color:#0EA5E9;font-family:monospace;background:#E0F2FE;
+                      border-radius:8px;padding:8px 20px;display:inline-block;">
+            {code}
+          </div>
+          <div style="color:#64748B;font-size:0.78rem;margin-top:8px;">
+            Copy the code above and paste it into the field below.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _nav_button(label: str, key: str, view: str = None, callback=None):
+    """A small navigation button rendered outside any form context."""
+    if st.button(label, key=key, use_container_width=True):
+        if callback:
+            callback()
+        if view:
+            _set_view(view)
+
+
+# ---------------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------------
+
+def _render_login():
+    mid = _centered()
+    with mid:
+        _logo_header("Sign in to your Security Operations Center")
+        with st.container(border=True):
+            with st.form("login_form", clear_on_submit=False):
+                username = st.text_input("Username", placeholder="e.g. admin")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button(
+                    "Login", use_container_width=True, type="primary"
+                )
+
+            if submitted:
+                if not username or not password:
+                    st.error("Please enter both username and password.")
+                else:
+                    user = database.authenticate(username.strip(), password)
+                    if not user:
+                        st.error("Incorrect username / password, or account is inactive.")
+                        database.log_action(None, "login_failed", f"username={username}")
+                    else:
+                        result = otp_service.send_otp(user, purpose="login")
+                        st.session_state.pending_otp_user = user
+                        st.session_state.last_otp_banner = result
+                        database.log_action(user["id"], "login_otp_sent")
+                        _set_view("otp")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            _nav_button("Create an account", key="nav_to_register", view="register")
+        with col2:
+            _nav_button("Forgot password?", key="nav_to_forgot", view="forgot")
+
+        st.caption(
+            f"Demo — username **{config.SEED_ADMIN_USERNAME}** "
+            f"/ password **{config.SEED_ADMIN_PASSWORD}**"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Register
+# ---------------------------------------------------------------------------
+
+def _render_register():
+    mid = _centered()
+    with mid:
+        _logo_header("Create your analyst account")
+
+        if st.session_state.get("otp_reg_success"):
+            st.success("✅ Account created!  You can now log in.")
+            if st.button("Go to Login →", type="primary",
+                         use_container_width=True, key="nav_reg_done"):
+                st.session_state.otp_reg_success = False
+                _set_view("login")
+            return
+
+        policy = _password_policy()
+
+        with st.container(border=True):
+            with st.form("register_form"):
+                full_name = st.text_input("Full Name")
+                email     = st.text_input("Email")
+                username  = st.text_input("Username")
+                c1, c2    = st.columns(2)
+                with c1:
+                    password = st.text_input("Password", type="password")
+                with c2:
+                    confirm  = st.text_input("Confirm Password", type="password")
+                st.caption(
+                    f"Min {policy.get('min_length', 8)} chars — "
+                    "upper, lower, number, special character."
+                )
+                submitted = st.form_submit_button(
+                    "Create Account", use_container_width=True, type="primary"
+                )
+
+            if submitted:
+                errs = []
+                if not all([full_name, email, username, password, confirm]):
+                    errs.append("All fields are required.")
+                if email and not security.is_valid_email(email):
+                    errs.append("Invalid email address.")
+                if password != confirm:
+                    errs.append("Passwords do not match.")
+                if password:
+                    errs.extend(security.validate_password_policy(password, policy))
+                if username and database.get_user_by_username(username.strip()):
+                    errs.append("Username already taken.")
+                if email and database.get_user_by_email(email.strip()):
+                    errs.append("Email already registered.")
+                if errs:
+                    for e in errs:
+                        st.error(e)
+                else:
+                    u = database.create_user(
+                        full_name.strip(), email.strip(), username.strip(),
+                        password, role="user"
+                    )
+                    database.log_action(u["id"], "user_registered")
+                    st.session_state.otp_reg_success = True
+                    st.rerun()
+
+        _nav_button("← Back to Login", key="nav_register_back", view="login")
+
+
+# ---------------------------------------------------------------------------
+# OTP verification  (shared for login + password-reset paths)
+# ---------------------------------------------------------------------------
+
+def _render_otp(purpose: str = "login"):
+    is_login = purpose == "login"
+    user_key = "pending_otp_user" if is_login else "pending_reset_user"
+    user     = st.session_state.get(user_key)
+
+    mid = _centered()
+    with mid:
+        _logo_header("Two-factor verification")
+
+        # Guard: user must have been set by the previous screen.
+        if not user:
+            st.warning("Your session expired. Please log in again.")
+            _nav_button("← Back to Login", key=f"nav_otp_expired_{purpose}", view="login")
+            return
+
+        # Dev-mode banner — shown above the form so it can never be hidden.
+        banner = st.session_state.get("last_otp_banner")
+        if banner:
+            _otp_dev_banner(banner)
+
+        # ── Main OTP form ────────────────────────────────────────────────
+        with st.form(f"otp_form_{purpose}", clear_on_submit=False):
+            st.markdown(
+                f"<p style='margin:0 0 10px;color:#475569;font-size:0.9rem;'>"
+                f"Enter the code sent to <b>{user['email']}</b></p>",
+                unsafe_allow_html=True,
+            )
+            code = st.text_input(
+                "6-digit verification code",
+                max_chars=6,
+                placeholder="e.g. 482916",
+                label_visibility="collapsed",
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                verify_clicked = st.form_submit_button(
+                    "✅ Verify Code",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with c2:
+                resend_clicked = st.form_submit_button(
+                    "📨 Resend Code",
+                    use_container_width=True,
+                )
+
+        # ── Handle Resend (outside form, after form renders) ─────────────
+        if resend_clicked:
+            new_result = otp_service.send_otp(user, purpose=purpose)
+            st.session_state.last_otp_banner = new_result
+            st.rerun()
+
+        # ── Handle Verify ────────────────────────────────────────────────
+        if verify_clicked:
+            trimmed = code.strip()
+            if not trimmed:
+                st.error("Please enter the verification code from the banner above.")
+            else:
+                ok, message = otp_service.verify_otp(user, trimmed, purpose=purpose)
+                if ok:
+                    if is_login:
+                        # ── Successful login ──────────────────────────────
+                        st.session_state.user             = user
+                        st.session_state[user_key]        = None
+                        st.session_state.last_otp_banner  = None
+                        st.session_state.route            = "app"
+                        database.log_action(user["id"], "login_success")
+                        st.rerun()
+                    else:
+                        # ── Reset OTP verified → go to set-new-password ───
+                        st.session_state.last_otp_banner = None
+                        database.log_action(user["id"], "reset_otp_verified")
+                        _set_view("reset_password")
+                else:
+                    st.error(message)
+
+        # ── Back link (always visible, outside the form) ─────────────────
+        if st.button("← Back to Login",
+                     key=f"nav_otp_back_{purpose}", use_container_width=True):
+            st.session_state[user_key]       = None
+            st.session_state.last_otp_banner = None
+            _set_view("login")
+
+
+# ---------------------------------------------------------------------------
+# Forgot password  (request OTP)
+# ---------------------------------------------------------------------------
+
+def _render_forgot():
+    mid = _centered()
+    with mid:
+        _logo_header("Reset your password")
+        with st.container(border=True):
+            with st.form("forgot_form"):
+                email     = st.text_input("Account email", placeholder="you@example.com")
+                submitted = st.form_submit_button(
+                    "Send Reset Code", type="primary", use_container_width=True
+                )
+
+            if submitted:
+                found = database.get_user_by_email(email.strip()) if email else None
+                if found:
+                    result = otp_service.send_otp(found, purpose="reset")
+                    st.session_state.pending_reset_user = found
+                    st.session_state.last_otp_banner    = result
+                    database.log_action(found["id"], "reset_otp_sent")
+                    _set_view("forgot_otp")
+                else:
+                    # Generic message — avoids disclosing which emails exist.
+                    st.info("If that email is registered a reset code has been sent.")
+
+        _nav_button("← Back to Login", key="nav_forgot_back", view="login")
+
+
+# ---------------------------------------------------------------------------
+# Reset password  (set new password after OTP verified)
+# ---------------------------------------------------------------------------
+
+def _render_reset_password():
+    mid = _centered()
+    with mid:
+        _logo_header("Choose a new password")
+
+        if st.session_state.get("otp_reset_success"):
+            st.success("✅ Password updated!  Please log in with your new password.")
+            if st.button("Go to Login →", type="primary",
+                         use_container_width=True, key="nav_reset_done"):
+                st.session_state.otp_reset_success = False
+                _set_view("login")
+            return
+
+        user = st.session_state.get("pending_reset_user")
+        if not user:
+            st.warning("Session expired.  Please start the reset process again.")
+            _nav_button("← Back to Login", key="nav_reset_expired", view="login")
+            return
+
+        policy = _password_policy()
+        with st.container(border=True):
+            with st.form("reset_password_form"):
+                new_pw  = st.text_input("New Password", type="password")
+                confirm = st.text_input("Confirm New Password", type="password")
+                submitted = st.form_submit_button(
+                    "Update Password", type="primary", use_container_width=True
+                )
+
+            if submitted:
+                errs = []
+                if not new_pw:
+                    errs.append("Please enter a new password.")
+                elif new_pw != confirm:
+                    errs.append("Passwords do not match.")
+                else:
+                    errs.extend(security.validate_password_policy(new_pw, policy))
+
+                if errs:
+                    for e in errs:
+                        st.error(e)
+                else:
+                    database.update_password(user["id"], new_pw)
+                    database.log_action(user["id"], "password_reset")
+                    st.session_state.pending_reset_user = None
+                    st.session_state.otp_reset_success  = True
+                    st.rerun()
+
+        _nav_button("← Back to Login", key="nav_reset_back",
+                    callback=lambda: setattr(
+                        st.session_state, "pending_reset_user", None
+                    ),
+                    view="login")
+
+
+# ---------------------------------------------------------------------------
+# Helpers used only here
+# ---------------------------------------------------------------------------
+
+def _password_policy():
+    return database.get_setting("password_policy") or config.DEFAULT_PASSWORD_POLICY
+
+
+# ---------------------------------------------------------------------------
+# Public dispatcher
+# ---------------------------------------------------------------------------
+
+def render_auth_page():
+    view = st.session_state.get("auth_view", "login")
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+
+    if view == "login":
+        _render_login()
+    elif view == "register":
+        _render_register()
+    elif view == "otp":
+        _render_otp(purpose="login")
+    elif view == "forgot":
+        _render_forgot()
+    elif view == "forgot_otp":
+        _render_otp(purpose="reset")
+    elif view == "reset_password":
+        _render_reset_password()
+    else:
+        st.session_state.auth_view = "login"
+        st.rerun()
