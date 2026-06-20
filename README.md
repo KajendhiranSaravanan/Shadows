@@ -2,7 +2,7 @@
 
 AI-powered SOC platform: Deep Learning IDS + Explainable AI (SHAP) + Risk
 Scoring + Security Recommendations + downloadable PDF Incident Reports, all
-behind email-OTP authentication with Admin/User RBAC.
+behind captcha-based login verification with Admin/User RBAC.
 
 ---
 
@@ -28,10 +28,11 @@ role, or log in as `admin` to see the **Admin** workspace.
 
 ## How login works (no mail server required)
 
-Login is username + password, then a 6-digit email OTP. If you haven't
-configured SMTP (see below), the app runs in **dev mode**: the OTP is shown
-directly in a banner on screen instead of being emailed, so the whole flow
-is testable end-to-end with zero external setup.
+Login is username + password, then a captcha challenge. Password reset still
+uses a 6-digit email OTP. If you haven't configured SMTP (see below), the
+password-reset flow runs in **dev mode**: the OTP is shown directly in a
+banner on screen instead of being emailed, so the recovery flow is still
+testable end-to-end with zero external setup.
 
 To send real emails, set these environment variables before launching:
 
@@ -114,7 +115,7 @@ NSL-KDD as CSV and upload it directly; no preprocessing required.
 ```
 shadowsec/
 ├── app.py                    # Main entry point — routing, landing page, sidebar
-├── login.py                  # Register / Login / OTP / Forgot-password screens
+├── login.py                  # Register / Login / Captcha / Forgot-password screens
 ├── otp_service.py            # OTP generation, SMTP delivery, dev-mode fallback
 ├── database.py                # SQLite persistence layer (users, otp, datasets,
 │                               #   predictions, reports, settings, audit log)
@@ -167,7 +168,7 @@ shadowsec/
 - Streaming inference for live NetFlow/IPFIX records instead of batch CSV uploads.
 - A real packet-capture connector (pcap → flow features) for the dataset pipeline.
 - A transactional email API (SendGrid/SES/Postmark) in place of raw `smtplib`.
-- OAuth/SSO identity providers alongside the username + password + OTP flow.
+- OAuth/SSO identity providers alongside the username + password + captcha flow.
 - Asset-criticality-aware recommendations (e.g. only suggest host isolation
   for non-production assets) once a CMDB integration exists.
 

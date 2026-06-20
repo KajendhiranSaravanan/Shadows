@@ -1,7 +1,7 @@
 """
 login.py
 ----------
-Authentication UI module — complete OTP flow.
+Authentication UI module — login captcha + password-reset OTP flow.
 
 Every interactive screen uses st.form so Streamlit captures widget values
 correctly at submit time.  Navigation links are plain st.button calls placed
@@ -12,7 +12,7 @@ Screens
 render_auth_page()  ->  dispatcher on st.session_state.auth_view
     "login"         ->  username + password
     "register"      ->  create account
-    "otp"           ->  6-digit code (login path)
+    "captcha"       ->  captcha challenge (login path)
     "forgot"        ->  request password-reset code
     "forgot_otp"    ->  verify password-reset code
     "reset_password"->  set new password
@@ -21,8 +21,10 @@ Session-state owned here
 ------------------------
     user                  logged-in user dict or None
     auth_view             which screen is active
-    pending_otp_user      user dict waiting for login OTP
+    pending_login_user    user dict waiting for login captcha
     pending_reset_user    user dict waiting for reset OTP
+    login_captcha_question  text shown in the captcha challenge
+    login_captcha_answer    expected answer for the captcha challenge
     last_otp_banner       send_otp() result dict (dev mode code + flags)
     otp_reg_success       True after successful registration
     otp_reset_success     True after successful password reset
@@ -31,6 +33,7 @@ Session-state owned here
 """
 
 import streamlit as st
+import random
 
 import config
 import database
@@ -68,39 +71,39 @@ def _logo_header(subtitle: str):
     )
 
 
-def _otp_dev_banner(send_result: dict):
-    """Orange banner that surfaces the OTP code when SMTP is not configured."""
-    if not send_result.get("dev_mode"):
-        st.success("📧 Verification code sent to your email address.")
-        return
-    code = send_result.get("otp", "")
-    label = (
-        "⚠️ SMTP failed — showing code here"
-        if send_result.get("error")
-        else "🔧 Dev mode — no SMTP configured"
-    )
-    st.markdown(
-        f"""
-        <div style="background:#FFF7ED;border:2px solid #F97316;border-radius:10px;
-                    padding:16px 20px;margin-bottom:14px;text-align:center;">
-          <div style="color:#9A3412;font-size:0.8rem;font-weight:600;margin-bottom:6px;">
-            {label}
-          </div>
-          <div style="color:#1E293B;font-size:0.85rem;margin-bottom:10px;">
-            Your one-time verification code:
-          </div>
-          <div style="font-size:2.6rem;font-weight:900;letter-spacing:0.4em;
-                      color:#0EA5E9;font-family:monospace;background:#E0F2FE;
-                      border-radius:8px;padding:8px 20px;display:inline-block;">
-            {code}
-          </div>
-          <div style="color:#64748B;font-size:0.78rem;margin-top:8px;">
-            Copy the code above and paste it into the field below.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def _captcha_reset():
+    st.session_state.pop("login_captcha_question", None)
+    st.session_state.pop("login_captcha_answer", None)
+
+
+def _captcha_generate():
+    left = random.randint(2, 9)
+    right = random.randint(1, 9)
+    op = random.choice(["+", "-", "×"])
+    if op == "+":
+        answer = left + right
+    elif op == "-":
+        left, right = max(left, right), min(left, right)
+        answer = left - right
+    else:
+        answer = left * right
+
+    st.session_state.login_captcha_question = f"What is {left} {op} {right}?"
+    st.session_state.login_captcha_answer = str(answer)
+
+
+def _captcha_banner():
+    st.info("Solve the captcha below to complete sign-in. This replaces the email OTP step for login.")
+
+
+def _ensure_login_captcha():
+    if not st.session_state.get("login_captcha_question"):
+        _captcha_generate()
+
+
+def _verify_login_captcha(submitted_value: str) -> bool:
+    expected = str(st.session_state.get("login_captcha_answer", "")).strip()
+    return submitted_value.strip() == expected
 
 
 def _nav_button(label: str, key: str, view: str = None, callback=None):
@@ -137,11 +140,11 @@ def _render_login():
                         st.error("Incorrect username / password, or account is inactive.")
                         database.log_action(None, "login_failed", f"username={username}")
                     else:
-                        result = otp_service.send_otp(user, purpose="login")
-                        st.session_state.pending_otp_user = user
-                        st.session_state.last_otp_banner = result
-                        database.log_action(user["id"], "login_otp_sent")
-                        _set_view("otp")
+                        st.session_state.pending_login_user = user
+                        _captcha_reset()
+                        _captcha_generate()
+                        database.log_action(user["id"], "login_captcha_requested")
+                        _set_view("captcha")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -222,90 +225,72 @@ def _render_register():
 
 
 # ---------------------------------------------------------------------------
-# OTP verification  (shared for login + password-reset paths)
+# Captcha verification  (login path)
 # ---------------------------------------------------------------------------
 
-def _render_otp(purpose: str = "login"):
-    is_login = purpose == "login"
-    user_key = "pending_otp_user" if is_login else "pending_reset_user"
-    user     = st.session_state.get(user_key)
+def _render_captcha():
+    user = st.session_state.get("pending_login_user")
 
     mid = _centered()
     with mid:
-        _logo_header("Two-factor verification")
+        _logo_header("Captcha verification")
 
         # Guard: user must have been set by the previous screen.
         if not user:
             st.warning("Your session expired. Please log in again.")
-            _nav_button("← Back to Login", key=f"nav_otp_expired_{purpose}", view="login")
+            _nav_button("← Back to Login", key="nav_captcha_expired", view="login")
             return
 
-        # Dev-mode banner — shown above the form so it can never be hidden.
-        banner = st.session_state.get("last_otp_banner")
-        if banner:
-            _otp_dev_banner(banner)
+        _captcha_banner()
+        _ensure_login_captcha()
 
-        # ── Main OTP form ────────────────────────────────────────────────
-        with st.form(f"otp_form_{purpose}", clear_on_submit=False):
+        with st.form("captcha_form", clear_on_submit=False):
             st.markdown(
-                f"<p style='margin:0 0 10px;color:#475569;font-size:0.9rem;'>"
-                f"Enter the code sent to <b>{user['email']}</b></p>",
+                f"<p style='margin:0 0 10px;color:#475569;font-size:0.95rem;'>"
+                f"{st.session_state.get('login_captcha_question', 'Solve the captcha')}</p>",
                 unsafe_allow_html=True,
             )
-            code = st.text_input(
-                "6-digit verification code",
-                max_chars=6,
-                placeholder="e.g. 482916",
+            answer = st.text_input(
+                "Captcha answer",
+                placeholder="Enter the answer",
                 label_visibility="collapsed",
             )
             c1, c2 = st.columns(2)
             with c1:
                 verify_clicked = st.form_submit_button(
-                    "✅ Verify Code",
+                    "✅ Verify Captcha",
                     use_container_width=True,
                     type="primary",
                 )
             with c2:
-                resend_clicked = st.form_submit_button(
-                    "📨 Resend Code",
+                refresh_clicked = st.form_submit_button(
+                    "🔄 New Challenge",
                     use_container_width=True,
                 )
 
-        # ── Handle Resend (outside form, after form renders) ─────────────
-        if resend_clicked:
-            new_result = otp_service.send_otp(user, purpose=purpose)
-            st.session_state.last_otp_banner = new_result
+        if refresh_clicked:
+            _captcha_generate()
             st.rerun()
 
-        # ── Handle Verify ────────────────────────────────────────────────
         if verify_clicked:
-            trimmed = code.strip()
-            if not trimmed:
-                st.error("Please enter the verification code from the banner above.")
+            if not answer.strip():
+                st.error("Please enter the captcha answer.")
+            elif _verify_login_captcha(answer):
+                st.session_state.user = user
+                st.session_state.pending_login_user = None
+                _captcha_reset()
+                st.session_state.route = "app"
+                database.log_action(user["id"], "login_success")
+                st.rerun()
             else:
-                ok, message = otp_service.verify_otp(user, trimmed, purpose=purpose)
-                if ok:
-                    if is_login:
-                        # ── Successful login ──────────────────────────────
-                        st.session_state.user             = user
-                        st.session_state[user_key]        = None
-                        st.session_state.last_otp_banner  = None
-                        st.session_state.route            = "app"
-                        database.log_action(user["id"], "login_success")
-                        st.rerun()
-                    else:
-                        # ── Reset OTP verified → go to set-new-password ───
-                        st.session_state.last_otp_banner = None
-                        database.log_action(user["id"], "reset_otp_verified")
-                        _set_view("reset_password")
-                else:
-                    st.error(message)
+                st.error("Incorrect captcha answer. Please try again.")
+                _captcha_generate()
 
         # ── Back link (always visible, outside the form) ─────────────────
         if st.button("← Back to Login",
-                     key=f"nav_otp_back_{purpose}", use_container_width=True):
-            st.session_state[user_key]       = None
-            st.session_state.last_otp_banner = None
+                     key="nav_captcha_back", use_container_width=True):
+            st.session_state.pending_login_user = None
+            _captcha_reset()
             _set_view("login")
 
 
@@ -417,8 +402,8 @@ def render_auth_page():
         _render_login()
     elif view == "register":
         _render_register()
-    elif view == "otp":
-        _render_otp(purpose="login")
+    elif view == "captcha":
+        _render_captcha()
     elif view == "forgot":
         _render_forgot()
     elif view == "forgot_otp":

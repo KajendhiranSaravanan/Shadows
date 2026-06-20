@@ -226,7 +226,20 @@ def render_app_shell():
         st.markdown("<div style='height:30px'></div>", unsafe_allow_html=True)
         if st.button("🚪 Logout", use_container_width=True):
             database.log_action(user["id"], "logout")
-            for key in ("user", "active_df", "detection_result", "explanation_cache", "live_feed"):
+            for key in (
+                "user",
+                "active_df",
+                "detection_result",
+                "explanation_cache",
+                "live_feed",
+                "pending_login_user",
+                "pending_reset_user",
+                "login_captcha_question",
+                "login_captcha_answer",
+                "last_otp_banner",
+                "otp_reset_success",
+                "otp_reg_success",
+            ):
                 st.session_state.pop(key, None)
             st.session_state.route = "landing"
             st.session_state.auth_view = "login"
